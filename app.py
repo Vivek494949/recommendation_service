@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import psycopg2
 from psycopg2.extras import execute_values
@@ -7,6 +8,13 @@ import numpy as np
 import os
 from typing import List
 import uvicorn
+
+class EmbeddingRequest(BaseModel):
+    book_id: str
+    title: str
+    description: str
+    text: str
+    author_address: str
 
 app = FastAPI(title="Book Recommendation Service")
 
@@ -41,12 +49,49 @@ def health_check():
     """Health check endpoint"""
     return {"status": "ok"}
 
+@app.post("/generate-embedding")
+def generate_embedding(book_id: str = Query(...)):
+    """Generate embedding for a book - this is what the Next.js API calls"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Check if embedding already exists
+        cur.execute("SELECT book_id FROM book_embeddings WHERE book_id = %s", (book_id,))
+        existing = cur.fetchone()
+        
+        if existing:
+            # Return existing embedding data
+            cur.execute("SELECT title, description, embedding, author_address FROM book_embeddings WHERE book_id = %s", (book_id,))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            return {
+                "book_id": book_id,
+                "title": row[0],
+                "description": row[1],
+                "embedding": row[2] if isinstance(row[2], list) else list(row[2]),
+                "author": row[3]
+            }
+        
+        # For new books, return placeholder - actual embedding stored via /store-embedding
+        cur.close()
+        conn.close()
+        return {
+            "book_id": book_id,
+            "title": f"Book {book_id}",
+            "description": f"Book description for {book_id}",
+            "embedding": [0.0] * 384,  # Placeholder embedding
+            "author": "0x0000000000000000000000000000000000000000"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/store-embedding")
-def store_embedding(book_id: str, title: str, description: str, author_address: str):
+def store_embedding(request: EmbeddingRequest):
     """Store book embedding in database"""
     try:
-        # Generate embedding
-        embedding = model.encode(f"{title} {description}", convert_to_tensor=False).tolist()
+        embedding = model.encode(request.text, convert_to_tensor=False).tolist()
         
         conn = get_db_connection()
         cur = conn.cursor()
@@ -60,13 +105,18 @@ def store_embedding(book_id: str, title: str, description: str, author_address: 
                 title = EXCLUDED.title,
                 description = EXCLUDED.description,
                 updated_at = CURRENT_TIMESTAMP
-        """, (book_id, title, description, embedding, author_address))
+        """, (request.book_id, request.title, request.description, embedding, request.author_address))
         
         conn.commit()
         cur.close()
         conn.close()
         
-        return {"status": "success", "message": "Embedding stored"}
+        return {
+            "status": "success",
+            "message": "Embedding stored",
+            "book_id": request.book_id,
+            "embedding": embedding
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
